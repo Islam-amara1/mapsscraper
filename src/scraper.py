@@ -45,10 +45,17 @@ class GoogleMapsScraper:
         
         try:
             await self.page.goto(search_url, wait_until="domcontentloaded")
-            await human_delay(0.5, 1)
             
-            # Wait for results container
+            # Wait for results container FIRST before trying to scroll it
             await self.page.wait_for_selector('div[role="feed"]', timeout=15000)
+            
+            # Faster initial scroll to trigger loading
+            await self.page.evaluate('''
+                const feed = document.querySelector('div[role="feed"]');
+                if (feed) feed.scrollTop += 3000;
+            ''')
+            await human_delay(0.8, 1.2)
+            
             console.print("[green]✓ Results loaded[/green]")
             return True
             
@@ -109,15 +116,21 @@ class GoogleMapsScraper:
                 
                 previous_count = current_count
                 
-                # Scroll the feed container
+                # More aggressive scroll to force Google to load more
                 await self.page.evaluate('''
                     const feed = document.querySelector('div[role="feed"]');
                     if (feed) {
-                        feed.scrollTop = feed.scrollTop + 1500;
+                        feed.scrollTop += 5000;
                     }
                 ''')
                 
-                await human_delay(0.3, 0.6)
+                # Small hover over the list to trigger active loading
+                try:
+                    await self.page.hover('div[role="feed"] div[role="article"]:last-child')
+                except:
+                    pass
+                    
+                await human_delay(0.6, 1.2)
             
             return current_count
             
@@ -149,187 +162,63 @@ class GoogleMapsScraper:
             return []
     
     async def scrape_listing(self, url: str) -> dict:
-        """Scrape a single business listing with improved selectors."""
+        """Scrape a single listing efficiently using unified JS extraction."""
         try:
             await self.page.goto(url, wait_until='domcontentloaded', timeout=20000)
-            await human_delay(0.3, 0.6)
+            await self.page.wait_for_selector('h1', timeout=7000)
             
-            # Wait for main content
-            await self.page.wait_for_selector('h1', timeout=8000)
+            # Unified extraction (Single IPC call for maximum speed)
+            data = await self.page.evaluate("""
+                () => {
+                    const getTxt = (sel) => {
+                        const el = Array.isArray(sel) 
+                            ? sel.reduce((acc, s) => acc || document.querySelector(s), null)
+                            : document.querySelector(sel);
+                        return el ? el.innerText.trim() : null;
+                    };
+
+                    const getAttr = (sel, attr) => {
+                        const el = document.querySelector(sel);
+                        return el ? el.getAttribute(attr) : null;
+                    };
+
+                    return {
+                        name: getTxt(['h1.DUwDvf', 'h1.fontHeadlineLarge', 'h1']),
+                        rating: getTxt(['div.F7nice span:first-child', 'span.ceNzKf', 'span.MW4etd']),
+                        reviews_count: getTxt(['div.F7nice span:last-child', 'span.UY7F9', 'button[jsaction*="reviews"]']),
+                        category: getTxt(['button[jsaction*="category"]', 'span.DkEaL']),
+                        address: getTxt(['button[data-item-id="address"]', 'div.rogA2c div.fontBodyMedium']),
+                        phone: getTxt(['button[data-item-id*="phone:tel"]', 'a[href^="tel:"]']),
+                        website: getAttr('a[data-item-id="authority"]', 'href') || getAttr('a[aria-label*="Website"]', 'href'),
+                        hours: getAttr('div[aria-label*="hours"]', 'aria-label') || getTxt('div.t39EBf')
+                    };
+                }
+            """)
             
-            result = {
-                'name': None,
-                'rating': None,
-                'reviews_count': None,
-                'category': None,
-                'address': None,
-                'phone': None,
-                'website': None,
-                'hours': None,
-                'google_maps_url': url
-            }
+            # Post-process numeric values
+            if data['rating']:
+                m = re.search(r'(\d+[.,]\d+|\d+)', data['rating'])
+                data['rating'] = float(m.group(1).replace(',', '.')) if m else None
             
-            # NAME - multiple selectors
-            name_selectors = ['h1.DUwDvf', 'h1.fontHeadlineLarge', 'h1']
-            for selector in name_selectors:
-                try:
-                    el = await self.page.query_selector(selector)
-                    if el:
-                        result['name'] = (await el.inner_text()).strip()
-                        break
-                except:
-                    continue
+            if data['reviews_count']:
+                m = re.search(r'(\d+)', data['reviews_count'].replace(',', '').replace('.', ''))
+                data['reviews_count'] = int(m.group(1)) if m else None
             
-            # RATING - multiple selectors
-            rating_selectors = [
-                'div.F7nice span:first-child',
-                'span.ceNzKf', 
-                'div.fontDisplayLarge',
-                'span.fontDisplayLarge',
-                'span.MW4etd',
-                'div[jsaction*="rating"] span',
-            ]
-            for selector in rating_selectors:
-                try:
-                    el = await self.page.query_selector(selector)
-                    if el:
-                        text = (await el.inner_text()).strip()
-                        match = re.search(r'(\d+[.,]\d+|\d+)', text)
-                        if match:
-                            result['rating'] = float(match.group(1).replace(',', '.'))
-                            break
-                except:
-                    continue
+            # Post-process address, phone, hours for formatting if they exist
+            if data['address']:
+                data['address'] = data['address'].replace('\n', ', ')
+            if data['phone']:
+                data['phone'] = data['phone'].replace('\n', ' ')
+                # If phone was extracted from an href, it might still be 'tel:...'
+                if data['phone'].startswith('tel:'):
+                    data['phone'] = data['phone'].replace('tel:', '')
+            if data['hours']:
+                # If hours came from innerText, it might have newlines
+                if not data['hours'].startswith('Open') and not data['hours'].startswith('Closed'): # Heuristic to check if it's an aria-label or innerText
+                    data['hours'] = data['hours'].replace('\n', ', ')
             
-            # REVIEWS COUNT
-            reviews_selectors = [
-                'div.F7nice span:last-child',
-                'span.UY7F9',
-                'button[jsaction*="reviews"]',
-                'span[aria-label*="reviews"]',
-            ]
-            for selector in reviews_selectors:
-                try:
-                    el = await self.page.query_selector(selector)
-                    if el:
-                        text = (await el.inner_text()).strip()
-                        # Match numbers with commas or parentheses: (1,234) or 1234
-                        clean_text = text.replace('.', '').replace(',', '')
-                        match = re.search(r'[\(]?([\d]+)[\)]?', clean_text)
-                        if match:
-                            result['reviews_count'] = int(match.group(1))
-                            break
-                except:
-                    continue
-            
-            # CATEGORY
-            category_selectors = [
-                'button[jsaction*="category"]',
-                'span.DkEaL',
-                'button.DkEaL',
-            ]
-            for selector in category_selectors:
-                try:
-                    el = await self.page.query_selector(selector)
-                    if el:
-                        result['category'] = (await el.inner_text()).strip()
-                        break
-                except:
-                    continue
-            
-            # ADDRESS - look for address button/div
-            address_selectors = [
-                'button[data-item-id="address"]',
-                'button[data-item-id*="address"] div.fontBodyMedium',
-                'div[data-item-id="address"]',
-                'button[aria-label*="Address"]',
-                'div.rogA2c div.fontBodyMedium',
-            ]
-            for selector in address_selectors:
-                try:
-                    el = await self.page.query_selector(selector)
-                    if el:
-                        text = (await el.inner_text()).strip()
-                        if text and len(text) > 5:
-                            result['address'] = text.replace('\n', ', ')
-                            break
-                except:
-                    continue
-            
-            # PHONE
-            phone_selectors = [
-                'button[data-item-id*="phone:tel"]',
-                'button[data-item-id*="phone"] div.fontBodyMedium',
-                'button[aria-label*="Phone"]',
-                'a[href^="tel:"]',
-            ]
-            for selector in phone_selectors:
-                try:
-                    el = await self.page.query_selector(selector)
-                    if el:
-                        text = (await el.inner_text()).strip()
-                        if text:
-                            result['phone'] = text.replace('\n', ' ')
-                            break
-                except:
-                    continue
-            
-            # If phone still None, try href
-            if not result['phone']:
-                try:
-                    el = await self.page.query_selector('a[href^="tel:"]')
-                    if el:
-                        href = await el.get_attribute('href')
-                        if href:
-                            result['phone'] = href.replace('tel:', '')
-                except:
-                    pass
-            
-            # WEBSITE
-            website_selectors = [
-                'a[data-item-id="authority"]',
-                'a[data-item-id*="authority"]',
-                'a[aria-label*="Website"]',
-                'button[data-item-id*="website"]',
-            ]
-            for selector in website_selectors:
-                try:
-                    el = await self.page.query_selector(selector)
-                    if el:
-                        href = await el.get_attribute('href')
-                        if href:
-                            result['website'] = href
-                            break
-                except:
-                    continue
-            
-            # HOURS
-            hours_selectors = [
-                'div[aria-label*="hours"]',
-                'div[aria-label*="Hours"]',
-                'button[data-item-id*="oh"]',
-                'div.t39EBf',
-            ]
-            for selector in hours_selectors:
-                try:
-                    el = await self.page.query_selector(selector)
-                    if el:
-                        aria_label = await el.get_attribute('aria-label')
-                        if aria_label:
-                            result['hours'] = aria_label
-                            break
-                        else:
-                            text = (await el.inner_text()).strip()
-                            if text:
-                                result['hours'] = text.replace('\n', ', ')
-                                break
-                except:
-                    continue
-            
-            # Update URL to current (in case of redirects)
-            result['google_maps_url'] = self.page.url
-            
-            return result
+            data['google_maps_url'] = self.page.url
+            return data
             
         except Exception as e:
             console.print(f"[red]✗ Error scraping listing: {e}[/red]")
@@ -345,55 +234,90 @@ class GoogleMapsScraper:
                 'google_maps_url': url
             }
     
-    async def scrape_all(self, query: str, location: str, limit: int = 50) -> list:
+    async def scrape_all(self, query: str, location: str, limit: int = 50, no_website_only: bool = False) -> list:
         """
-        Scrape all businesses matching the search criteria.
-        
-        Args:
-            query: Business type to search for
-            location: Location to search in
-            limit: Maximum number of businesses to scrape
-            
-        Returns:
-            list: List of business data dictionaries
+        Scrape all businesses matching the search criteria iteratively.
         """
         results = []
+        processed_urls = set()
         
-        # Search for businesses
+        search_term = f"{query} in {location}"
+        search_url = f"{self.base_url}{quote_plus(search_term)}"
+        self.current_search_url = search_url # Store for return navigation
+        
+        # Initial Search
         if not await self.search(query, location):
             return results
         
-        # Scroll to load more results
-        await self.scroll_results(limit)
+        # 1. Prepare Background Listing Page (Optimization: No more search reloads!)
+        listing_page = await self.page.context.new_page()
         
-        # Get listing URLs
-        urls = await self.get_listing_urls()
+        console.print(f"\n[cyan]📋 Starting High-Speed Scrape... (Target: {limit} leads)[/cyan]")
         
-        if not urls:
-            console.print("[red]✗ No listings found to scrape[/red]")
-            return results
-        
-        # Limit the URLs to scrape
-        urls_to_scrape = urls[:limit]
-        console.print(f"\n[cyan]📋 Scraping {len(urls_to_scrape)} businesses...[/cyan]\n")
-        
-        # Scrape each listing
-        for i, url in enumerate(urls_to_scrape, 1):
-            console.print(f"[dim]({i}/{len(urls_to_scrape)})[/dim] ", end="")
-            
-            data = await self.scrape_listing(url)
-            
-            if data.get("name"):
-                rating = data.get("rating", "N/A")
-                console.print(f"[green]✅ {data['name']} ({rating}⭐)[/green]")
-                results.append(data)
-            else:
-                console.print(f"[yellow]⚠ Could not scrape listing[/yellow]")
-            
-            # Human delay between scrapes
-            await human_delay()
-        
-        console.print(f"\n[green]✓ Successfully scraped {len(results)} businesses[/green]")
+        total_attempts = 0
+        try:
+            while len(results) < limit:
+                # 1. Scroll Results
+                await self.scroll_results(limit * 3)
+                
+                # 2. Extract current URLs from sidebar
+                all_urls = await self.get_listing_urls()
+                new_urls = [u for u in all_urls if u not in processed_urls]
+                
+                if not new_urls:
+                    console.print("[red]❌ Exhausted all possible results.[/red]")
+                    break
+                
+                # 3. Process Batch
+                for url in new_urls:
+                    if len(results) >= limit:
+                        break
+                    
+                    processed_urls.add(url)
+                    total_attempts += 1
+                    
+                    # --- SIDEBAR RADAR (Optimization for No-Website Filter) ---
+                    # If user only wants leads without websites, we check the sidebar button before clicking
+                    if no_website_only:
+                        has_website_indicator = await self.page.evaluate(f"""
+                            (targetUrl) => {{
+                                const slug = targetUrl.split('/place/')[1]?.split('/')[0];
+                                const container = document.querySelector(`a[href*="${{slug}}"]`)?.closest('div[role="article"]');
+                                if (!container) return false;
+                                return !!(container.querySelector('a[aria-label*="Website"]') || 
+                                         container.querySelector('button[aria-label*="Website"]'));
+                            }}
+                        """, url)
+                        
+                        if has_website_indicator:
+                            continue # Skip without opening second tab!
+
+                    # 4. Deep scrape using the SECOND TAB
+                    console.print(f"[cyan]▶ [{len(results)}/{limit} leads][/cyan] Scoping: ", end="")
+                    
+                    original_page = self.page
+                    self.page = listing_page
+                    try:
+                        data = await self.scrape_listing(url)
+                    finally:
+                        self.page = original_page
+                    
+                    if data.get("name"):
+                        if no_website_only and data.get("website"):
+                            console.print(f"[yellow]⏭ Skipped {data['name']} (Has website)[/yellow]")
+                            continue
+                        
+                        rating = data.get("rating", "N/A")
+                        console.print(f"[bold green]✅ {data['name']} ({rating}⭐)[/bold green]")
+                        results.append(data)
+                    else:
+                        console.print(f"[red]⚠ Failed[/red]")
+                        
+                    await human_delay(0.1, 0.3)
+        finally:
+            await listing_page.close()
+
+        console.print(f"\n[bold green]🏁 Scrape Complete! Found {len(results)} leads total.[/bold green]")
         return results
 
 

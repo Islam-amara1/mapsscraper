@@ -14,6 +14,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from src.browser import create_stealth_browser, close_browser
 from src.scraper import GoogleMapsScraper
 from src.exporter import Exporter
+from src.geo import fetch_neighborhoods
 from src.config import settings
 
 app = typer.Typer(
@@ -63,7 +64,7 @@ def display_summary(results: list, query: str, location: str):
     console.print(table)
 
 
-async def run_scraper(query: str, location: str, limit: int, headless: bool) -> list:
+async def run_scraper(query: str, location: str, limit: int, headless: bool, no_website: bool = False) -> list:
     """Run the scraper asynchronously."""
     # Override headless setting if specified
     if headless:
@@ -80,7 +81,7 @@ async def run_scraper(query: str, location: str, limit: int, headless: bool) -> 
             browser, context, page = await create_stealth_browser()
         
         scraper = GoogleMapsScraper(browser, page)
-        results = await scraper.scrape_all(query, location, limit)
+        results = await scraper.scrape_all(query, location, limit, no_website_only=no_website)
         return results
         
     except Exception as e:
@@ -114,7 +115,9 @@ def scrape(
     location: str = typer.Option(..., "--location", "-l", help="Location to search in"),
     limit: int = typer.Option(50, "--limit", "-n", help="Maximum number of results"),
     output: str = typer.Option("csv", "--output", "-o", help="Output format: csv/json/excel/all"),
-    headless: bool = typer.Option(False, "--headless", "-h", help="Run browser in headless mode")
+    headless: bool = typer.Option(False, "--headless", "-h", help="Run browser in headless mode"),
+    no_website: bool = typer.Option(False, "--no-website", help="Only include businesses without a website"),
+    expand: bool = typer.Option(False, "--expand", "-e", help="Fetch real neighborhoods from OSM to maximize leads")
 ):
     """
     Scrape businesses from Google Maps.
@@ -129,12 +132,43 @@ def scrape(
         f"[cyan]Location:[/cyan] {location}\n"
         f"[cyan]Limit:[/cyan] {limit}\n"
         f"[cyan]Output:[/cyan] {output}\n"
-        f"[cyan]Headless:[/cyan] {headless}",
+        f"[cyan]Headless:[/cyan] {headless}\n"
+        f"[cyan]Filter No Website:[/cyan] {no_website}\n"
+        f"[cyan]Expand Search:[/cyan] {expand}",
         title="🔍 Search Parameters"
     ))
     
-    # Run scraper
-    results = asyncio.run(run_scraper(query, location, limit, headless))
+    if expand:
+        # Fetch real districts from Overpass API
+        districts = asyncio.run(fetch_neighborhoods(location))
+        
+        if districts:
+            console.print(f"[green]📂 Successfully fetched {len(districts)} real districts![/green]")
+            all_results = []
+            seen_names = set()
+            
+            for i, district in enumerate(districts, 1):
+                full_loc = f"{district}, {location}"
+                console.print(f"\n[bold magenta]📍 Area {i}/{len(districts)}: {district}[/bold magenta]")
+                
+                # We divide the total limit by number of districts, or just keep going until hit limit
+                results = asyncio.run(run_scraper(query, full_loc, limit, headless, no_website))
+                
+                # Check results and deduplicate
+                for r in results:
+                    if r['name'] not in seen_names:
+                        all_results.append(r)
+                        seen_names.add(r['name'])
+                
+                if len(all_results) >= limit:
+                    break
+            results = all_results
+        else:
+            console.print("[yellow]⚠ No sub-districts found. Running standard search.[/yellow]")
+            results = asyncio.run(run_scraper(query, location, limit, headless, no_website))
+    else:
+        # Run standard scraper
+        results = asyncio.run(run_scraper(query, location, limit, headless, no_website))
     
     if results:
         # Display summary
@@ -160,7 +194,8 @@ def bulk(
     queries_file: Path = typer.Argument(..., help="Path to file with queries (format: query|location per line)"),
     limit: int = typer.Option(50, "--limit", "-n", help="Maximum results per query"),
     output: str = typer.Option("csv", "--output", "-o", help="Output format: csv/json/excel/all"),
-    headless: bool = typer.Option(False, "--headless", "-h", help="Run browser in headless mode")
+    headless: bool = typer.Option(False, "--headless", "-h", help="Run browser in headless mode"),
+    no_website: bool = typer.Option(False, "--no-website", help="Only include businesses without a website")
 ):
     """
     Run bulk scraping from a queries file.
@@ -197,7 +232,8 @@ def bulk(
         f"[cyan]Queries file:[/cyan] {queries_file}\n"
         f"[cyan]Total queries:[/cyan] {len(queries)}\n"
         f"[cyan]Limit per query:[/cyan] {limit}\n"
-        f"[cyan]Output format:[/cyan] {output}",
+        f"[cyan]Output format:[/cyan] {output}\n"
+        f"[cyan]Filter No Website:[/cyan] {no_website}",
         title="📋 Bulk Scraping Parameters"
     ))
     
@@ -213,7 +249,7 @@ def bulk(
     for i, (query, location) in enumerate(queries, 1):
         console.print(f"\n[bold cyan]━━━ Processing {i}/{len(queries)}: {query} in {location} ━━━[/bold cyan]\n")
         
-        results = asyncio.run(run_scraper(query, location, limit, headless))
+        results = asyncio.run(run_scraper(query, location, limit, headless, no_website))
         
         if results:
             # Export results for this query
@@ -277,6 +313,7 @@ def version():
         "  • Typer + Rich",
         title="ℹ️ About"
     ))
+
 
 
 if __name__ == "__main__":

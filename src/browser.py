@@ -18,7 +18,7 @@ except ImportError:
 from src.config import settings, USER_AGENTS, VIEWPORTS
 
 
-async def create_stealth_browser() -> tuple[Browser, BrowserContext, Page]:
+async def create_stealth_browser(headless: bool = None, storage_state: str = None) -> tuple[Browser, BrowserContext, Page]:
     """
     Create a stealth browser with anti-detection measures.
     
@@ -28,8 +28,9 @@ async def create_stealth_browser() -> tuple[Browser, BrowserContext, Page]:
     playwright = await async_playwright().start()
     
     # Launch Chromium with anti-detection args
+    is_headless = headless if headless is not None else settings.HEADLESS
     browser = await playwright.chromium.launch(
-        headless=settings.HEADLESS,
+        headless=is_headless,
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
@@ -57,6 +58,7 @@ async def create_stealth_browser() -> tuple[Browser, BrowserContext, Page]:
         geolocation={"latitude": 40.7128, "longitude": -74.0060},  # New York
         color_scheme="light",
         device_scale_factor=1,
+        storage_state=storage_state
     )
     
     # Create page
