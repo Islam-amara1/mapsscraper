@@ -5,6 +5,8 @@ Uses Playwright with anti-detection measures.
 
 import asyncio
 import random
+import os
+from pathlib import Path
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 # Support both old and new playwright_stealth API
@@ -18,19 +20,29 @@ except ImportError:
 from src.config import settings, USER_AGENTS, VIEWPORTS
 
 
-async def create_stealth_browser(headless: bool = None, storage_state: str = None) -> tuple[Browser, BrowserContext, Page]:
-    """
-    Create a stealth browser with anti-detection measures.
-    
-    Returns:
-        tuple: (browser, context, page)
-    """
-    playwright = await async_playwright().start()
-    
-    # Launch Chromium with anti-detection args
-    is_headless = headless if headless is not None else settings.HEADLESS
-    browser = await playwright.chromium.launch(
-        headless=is_headless,
+def _system_chromium_candidates() -> list[str]:
+    """Return candidate system Chrome/Chromium binary paths."""
+    env_candidates = [
+        os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"),
+        os.getenv("CHROME_BIN"),
+        os.getenv("CHROMIUM_BIN"),
+    ]
+    path_candidates = [
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/snap/bin/chromium",
+        "/opt/google/chrome/chrome",
+    ]
+    candidates = [p for p in env_candidates + path_candidates if p]
+    return [p for p in candidates if Path(p).exists()]
+
+
+async def _launch_with_fallback(playwright, headless: bool) -> Browser:
+    """Launch bundled Chromium first, then fallback to a system executable."""
+    launch_args = dict(
+        headless=headless,
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
@@ -41,8 +53,42 @@ async def create_stealth_browser(headless: bool = None, storage_state: str = Non
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--lang=en-US",
-        ]
+        ],
     )
+    try:
+        return await playwright.chromium.launch(**launch_args)
+    except Exception as e:
+        error_text = str(e)
+        if "Executable doesn't exist" not in error_text:
+            raise
+        for executable_path in _system_chromium_candidates():
+            try:
+                print(f"Playwright fallback: trying system browser at {executable_path}")
+                return await playwright.chromium.launch(
+                    **launch_args,
+                    executable_path=executable_path,
+                )
+            except Exception:
+                continue
+        raise
+
+
+async def create_stealth_browser(headless: bool = None, storage_state: str = None) -> tuple[Browser, BrowserContext, Page]:
+    """
+    Create a stealth browser with anti-detection measures.
+    
+    Returns:
+        tuple: (browser, context, page)
+    """
+    playwright = await async_playwright().start()
+    is_headless = headless if headless is not None else settings.HEADLESS
+    try:
+        browser = await _launch_with_fallback(playwright, is_headless)
+    except Exception:
+        await playwright.stop()
+        raise
+    # Keep a handle so we can stop Playwright cleanly during shutdown.
+    setattr(browser, "_playwright_instance", playwright)
     
     # Random viewport and user-agent
     viewport = random.choice(VIEWPORTS)
@@ -188,6 +234,9 @@ async def close_browser(browser: Browser) -> None:
     """
     try:
         await browser.close()
+        playwright = getattr(browser, "_playwright_instance", None)
+        if playwright is not None:
+            await playwright.stop()
     except Exception as e:
         print(f"Warning: Error closing browser: {e}")
 
