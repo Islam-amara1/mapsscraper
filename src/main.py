@@ -6,16 +6,12 @@ import asyncio
 import typer
 from typing import Optional
 from pathlib import Path
+import subprocess
+import sys
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
-
-from src.browser import create_stealth_browser, close_browser
-from src.scraper import GoogleMapsScraper
-from src.exporter import Exporter
-from src.geo import fetch_neighborhoods
-from src.config import settings
 
 app = typer.Typer(
     name="Google Maps Scraper",
@@ -66,6 +62,10 @@ def display_summary(results: list, query: str, location: str):
 
 async def run_scraper(query: str, location: str, limit: int, headless: bool, no_website: bool = False) -> list:
     """Run the scraper asynchronously."""
+    from src.browser import create_stealth_browser, close_browser
+    from src.scraper import GoogleMapsScraper
+    from src.config import settings
+
     # Override headless setting if specified
     if headless:
         settings.HEADLESS = True
@@ -94,6 +94,8 @@ async def run_scraper(query: str, location: str, limit: int, headless: bool, no_
 
 def export_results(results: list, query: str, location: str, output_format: str) -> dict:
     """Export results to specified format."""
+    from src.exporter import Exporter
+
     exporter = Exporter()
     
     if output_format == "all":
@@ -117,7 +119,8 @@ def scrape(
     output: str = typer.Option("csv", "--output", "-o", help="Output format: csv/json/excel/all"),
     headless: bool = typer.Option(False, "--headless", "-h", help="Run browser in headless mode"),
     no_website: bool = typer.Option(False, "--no-website", help="Only include businesses without a website"),
-    expand: bool = typer.Option(False, "--expand", "-e", help="Fetch real neighborhoods from OSM to maximize leads")
+    expand: bool = typer.Option(False, "--expand", "-e", help="Fetch real neighborhoods from OSM to maximize leads"),
+    crm_import: bool = typer.Option(True, "--crm-import/--no-crm-import", help="Auto-import CSV output into local CRM")
 ):
     """
     Scrape businesses from Google Maps.
@@ -139,6 +142,8 @@ def scrape(
     ))
     
     if expand:
+        from src.geo import fetch_neighborhoods
+
         # Fetch real districts from Overpass API
         districts = asyncio.run(fetch_neighborhoods(location))
         
@@ -177,6 +182,17 @@ def scrape(
         # Export results
         console.print("\n[cyan]Exporting data...[/cyan]")
         exported = export_results(results, query, location, output)
+        if crm_import:
+            try:
+                from src.crm_db import import_from_scraper_csv
+
+                csv_path = exported.get("csv")
+                if csv_path:
+                    imported_rows = import_from_scraper_csv(csv_path)
+                    if imported_rows:
+                        console.print(f"[green]📋 CRM: Imported {imported_rows} lead(s).[/green]")
+            except Exception as e:
+                console.print(f"[yellow]CRM import skipped: {e}[/yellow]")
         
         # Final summary
         console.print(Panel(
@@ -195,7 +211,8 @@ def bulk(
     limit: int = typer.Option(50, "--limit", "-n", help="Maximum results per query"),
     output: str = typer.Option("csv", "--output", "-o", help="Output format: csv/json/excel/all"),
     headless: bool = typer.Option(False, "--headless", "-h", help="Run browser in headless mode"),
-    no_website: bool = typer.Option(False, "--no-website", help="Only include businesses without a website")
+    no_website: bool = typer.Option(False, "--no-website", help="Only include businesses without a website"),
+    crm_import: bool = typer.Option(True, "--crm-import/--no-crm-import", help="Auto-import CSV output into local CRM")
 ):
     """
     Run bulk scraping from a queries file.
@@ -254,6 +271,15 @@ def bulk(
         if results:
             # Export results for this query
             exported = export_results(results, query, location, output)
+            if crm_import:
+                try:
+                    from src.crm_db import import_from_scraper_csv
+
+                    csv_path = exported.get("csv")
+                    if csv_path:
+                        import_from_scraper_csv(csv_path)
+                except Exception:
+                    pass
             all_results.append({
                 'query': query,
                 'location': location,
@@ -292,6 +318,7 @@ def bulk(
         )
     
     console.print(summary_table)
+    from src.config import settings
     console.print(Panel(
         f"[green]✅ Bulk scraping complete![/green]\n\n"
         f"[cyan]Total queries:[/cyan] {len(queries)}\n"
@@ -315,7 +342,40 @@ def version():
     ))
 
 
+@app.command("crm")
+def crm(
+    port: int = typer.Option(8501, "--port", help="Streamlit server port"),
+):
+    """Launch the local CRM frontend (Streamlit)."""
+    app_path = Path(__file__).parent.parent / "frontend" / "app.py"
+    if not app_path.exists():
+        console.print(f"[red]CRM app not found at {app_path}[/red]")
+        raise typer.Exit(1)
+    console.print(Panel(
+        f"[cyan]Launching CRM:[/cyan] python -m streamlit run {app_path} --server.port {port}",
+        title="📋 CRM"
+    ))
+    subprocess.run(
+        [sys.executable, "-m", "streamlit", "run", str(app_path), "--server.port", str(port)],
+        check=False,
+    )
+
+
+@app.command("crm-import")
+def crm_import_cmd(
+    force: bool = typer.Option(False, "--force", help="Reimport CSVs even if previously imported"),
+):
+    """Import any new scraper CSVs from data/results into the CRM."""
+    from src.crm_db import import_new_results
+
+    summary = import_new_results(force=force)
+    console.print(Panel(
+        f"[green]Imported files:[/green] {summary['files']}\n"
+        f"[green]Imported rows:[/green] {summary['rows']}",
+        title="📥 CRM Import"
+    ))
+
+
 
 if __name__ == "__main__":
     app()
-

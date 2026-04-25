@@ -39,6 +39,8 @@ cd google-maps-scraper
 ### 2. Install dependencies
 
 ```bash
+python3 -m venv .venv
+. .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -124,6 +126,8 @@ google-maps-scraper/
 │   ├── scraper.py       # Scraping logic
 │   ├── exporter.py      # Data export (CSV, JSON, Excel)
 │   └── config.py        # Configuration settings
+├── frontend/
+│   └── app.py           # Streamlit CRM UI
 ├── data/
 │   └── results/         # Scraped data output
 ├── requirements.txt
@@ -161,3 +165,18 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [playwright-stealth](https://github.com/AtuboDad/playwright_stealth) - Anti-detection
 - [Typer](https://typer.tiangolo.com/) - CLI framework
 - [Rich](https://rich.readthedocs.io/) - Beautiful terminal output
+
+## 📋 CRM (Call Tracking)
+
+Local CRM for tracking call outcomes and next actions per lead. It auto-imports new scraper CSVs from `data/results`.
+
+```bash
+# SvelteKit CRM (recommended)
+cd web
+npm install
+npm run dev
+```
+
+Then open `http://localhost:5173`.
+
+Scrapes auto-import CSV outputs into the CRM DB by default; disable with `--no-crm-import`.
